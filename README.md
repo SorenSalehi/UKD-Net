@@ -66,6 +66,7 @@ Benchmarked on NVIDIA GPU with input tensor size `(1, 4, 128, 128, 128)`:
 ├── utils/
 │   └── loss_metrics.py         # DWKD, Boundary Loss, Dice, HD95, NSD, Lesion Recall
 ├── train.py                    # Unified Teacher pre-training & Student distillation pipeline
-├── evaluate.py                 # Full metric & efficiency benchmarking suite
+├── BraTS_evaluate.py                 # Full metric & efficiency benchmarking suite - BraTS
+├── MSD_evaluate.py                 # Full metric & efficiency benchmarking suite - MSD
 ├── requirements.txt            # Python dependencies
 └── README.md
