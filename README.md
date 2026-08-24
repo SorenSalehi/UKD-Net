@@ -1,7 +1,8 @@
 # 🧠 SAXNet-Distill: Knowledge Distillation with SAXNet Teacher for 3D Brain Tumor Segmentation (BraTS 2023 & MSD)
 
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-EE4C2C.svg?logo=pytorch)](https://pytorch.org/)
-[![Dataset](https://img.shields.io/badge/Dataset-BraTS_2023_%7C_MSD_Brain-blue.svg)](https://www.synapse.org/#!Synapse:syn51156910)
+[![Dataset: BraTS 2023](https://img.shields.io/badge/Dataset-BraTS_2023-blue.svg)](https://www.synapse.org/#!Synapse:syn51156910)
+[![Dataset: MSD](https://img.shields.io/badge/Dataset-MSD_Brain_Tumour-orange.svg)](http://medicaldecathlon.com/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 An end-to-end framework for high-accuracy, resource-efficient 3D brain tumor segmentation on benchmark datasets including **BraTS 2023** and **MSD (Medical Segmentation Decathlon - Task01 Brain Tumour)**. This repository implements **SAXNetV1** (a 3D U-Net enhanced with multi-scale Spatial and Channel Attention mechanisms) as a high-capacity Teacher model, which is subsequently distilled into **LATUPStudent**—an ultra-lightweight 3D model designed for fast, low-memory clinical inference.
