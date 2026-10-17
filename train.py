@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from data.dataset import BraTS2023Dataset, find_nii_adaptive, precompute_sdfs_unified
+from data.kits23_dataset import KiTS23Dataset, discover_kits_cases, preprocess_kits_cases
 from models.saxnet import SAXNetV1
 from models.student import LATUPStudent
 from utils.loss_metrics import (
@@ -38,7 +39,14 @@ ROI_SIZE = (128, 128, 128)
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", choices=("brats", "kits23"), default="brats",
+                        help="brats = 4-ch MRI (default, original behaviour); kits23 = 1-ch CT kidney/tumor/cyst")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--max-cases", type=int, default=None,
+                        help="Use only the first N cases (smoke tests). Use a fresh --save-dir when changing it.")
+    parser.add_argument("--roi-size", type=int, default=128, help="Cubic patch size (e.g. 96 to save GPU memory)")
+    parser.add_argument("--kits-spacing", type=float, default=3.0, help="KiTS23 isotropic resampling spacing (mm)")
+    parser.add_argument("--prep-workers", type=int, default=2, help="Processes for the one-off KiTS23 resampling")
     parser.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR)
     parser.add_argument("--split-file", type=Path, default=None)
     parser.add_argument("--teacher-checkpoint", type=Path, default=None)
@@ -70,7 +78,9 @@ def set_seed(seed=SPLIT_SEED):
     torch.backends.cudnn.benchmark = False
 
 
-def discover_valid_cases(data_dir):
+def discover_valid_cases(data_dir, dataset="brats"):
+    if dataset == "kits23":
+        return discover_kits_cases(data_dir)
     cases = sorted(p for p in Path(data_dir).iterdir() if p.is_dir() and not p.name.startswith("."))
     required = ("flair", "t1", "t1ce", "t2", "seg")
     valid = [p for p in cases if all(find_nii_adaptive(str(p), modality) for modality in required)]
@@ -79,8 +89,10 @@ def discover_valid_cases(data_dir):
     return valid
 
 
-def load_or_create_split(data_dir, split_path):
-    valid_cases = discover_valid_cases(data_dir)
+def load_or_create_split(data_dir, split_path, dataset="brats", max_cases=None):
+    valid_cases = discover_valid_cases(data_dir, dataset)
+    if max_cases:
+        valid_cases = valid_cases[:max_cases]
     names = [case.name for case in valid_cases]
     if split_path.exists():
         split = json.loads(split_path.read_text())
@@ -108,35 +120,48 @@ def load_or_create_split(data_dir, split_path):
     return split
 
 
-def make_loaders(data_dir, split, teacher_batch_size, student_batch_size, workers, sdf_dir=None):
+def make_loaders(data_dir, split, teacher_batch_size, student_batch_size, workers, sdf_dir=None,
+                 dataset="brats", cache_dir=None, kits_spacing=3.0, prep_workers=2):
     def paths(part):
         return [str(Path(data_dir) / name) for name in split[part]]
 
-    if sdf_dir is not None:
-        sdf_dir = Path(sdf_dir)
-        sdf_dir.mkdir(parents=True, exist_ok=True)
-        # Match train.py: precompute SDFs for the training and validation cases.
-        precompute_sdfs_unified(
-            str(data_dir),
-            paths("train") + paths("val"),
-            str(sdf_dir),
-            "BraTS",
-            ROI_SIZE,
-        )
-
-    datasets = {
-        "train": BraTS2023Dataset(
-            paths("train"), sdf_dir=str(sdf_dir) if sdf_dir else None,
-            roi_size=ROI_SIZE, augment=True, return_case_name=True
-        ),
-        "val": BraTS2023Dataset(
-            paths("val"), sdf_dir=str(sdf_dir) if sdf_dir else None,
-            roi_size=ROI_SIZE, augment=False, return_case_name=True
-        ),
-        "test": BraTS2023Dataset(paths("test"), roi_size=ROI_SIZE, augment=False, return_case_name=True),
-    }
     common = {"num_workers": workers, "pin_memory": True, "persistent_workers": workers > 0}
-    teacher_train = DataLoader(datasets["train"], batch_size=teacher_batch_size, shuffle=True, **common)
+
+    if dataset == "kits23":
+        # One-off resampling to isotropic spacing; cached so later runs start instantly.
+        all_dirs = paths("train") + paths("val") + paths("test")
+        preprocess_kits_cases(all_dirs, cache_dir, (kits_spacing,) * 3, workers=prep_workers)
+        need_sdf = sdf_dir is not None  # only the student stage uses the boundary loss
+        datasets = {
+            "train": KiTS23Dataset(split["train"], cache_dir, ROI_SIZE, mode="train", compute_sdf=need_sdf),
+            "train_teacher": KiTS23Dataset(split["train"], cache_dir, ROI_SIZE, mode="train", compute_sdf=False),
+            "val": KiTS23Dataset(split["val"], cache_dir, ROI_SIZE, mode="eval"),
+            "test": KiTS23Dataset(split["test"], cache_dir, ROI_SIZE, mode="eval"),
+        }
+    else:
+        if sdf_dir is not None:
+            sdf_dir = Path(sdf_dir)
+            sdf_dir.mkdir(parents=True, exist_ok=True)
+            # Match train.py: precompute SDFs for the training and validation cases.
+            precompute_sdfs_unified(
+                str(data_dir),
+                paths("train") + paths("val"),
+                str(sdf_dir),
+                "BraTS",
+                ROI_SIZE,
+            )
+        datasets = {
+            "train": BraTS2023Dataset(
+                paths("train"), sdf_dir=str(sdf_dir) if sdf_dir else None,
+                roi_size=ROI_SIZE, augment=True, return_case_name=True
+            ),
+            "val": BraTS2023Dataset(
+                paths("val"), sdf_dir=str(sdf_dir) if sdf_dir else None,
+                roi_size=ROI_SIZE, augment=False, return_case_name=True
+            ),
+            "test": BraTS2023Dataset(paths("test"), roi_size=ROI_SIZE, augment=False, return_case_name=True),
+        }
+    teacher_train = DataLoader(datasets.get("train_teacher", datasets["train"]), batch_size=teacher_batch_size, shuffle=True, **common)
     student_train = DataLoader(datasets["train"], batch_size=student_batch_size, shuffle=True, **common)
     val = DataLoader(datasets["val"], batch_size=1, shuffle=False, **common)
     test = DataLoader(datasets["test"], batch_size=1, shuffle=False, **common)
@@ -205,10 +230,10 @@ def evaluate_student_trainpy(model, loader, device, description):
     }
 
 
-def train_teacher(args, train_loader, val_loader, device, amp):
+def train_teacher(args, train_loader, val_loader, device, amp, in_channels=4):
     best_path = args.save_dir / "best_saxnet_teacher.pth"
     last_path = args.save_dir / "last_saxnet_teacher.pth"
-    model = SAXNetV1().to(device)
+    model = SAXNetV1(in_channels=in_channels).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.teacher_lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.teacher_epochs, eta_min=1e-6)
     scaler = torch.amp.GradScaler(device.type, enabled=amp)
@@ -261,10 +286,10 @@ def train_teacher(args, train_loader, val_loader, device, amp):
     return best_path
 
 
-def load_frozen_teacher(path, device):
+def load_frozen_teacher(path, device, in_channels=4):
     if not path.exists():
         raise FileNotFoundError(f"SAXNet teacher checkpoint not found: {path}")
-    model = SAXNetV1().to(device)
+    model = SAXNetV1(in_channels=in_channels).to(device)
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state_dict"])
     model.eval()
@@ -273,10 +298,10 @@ def load_frozen_teacher(path, device):
     return model
 
 
-def train_student(args, teacher, train_loader, val_loader, device, amp=False):
+def train_student(args, teacher, train_loader, val_loader, device, amp=False, in_channels=4):
     best_path = args.save_dir / "best_distilled_student.pth"
     last_path = args.save_dir / "last_distilled_student.pth"
-    student = LATUPStudent(in_channels=4, out_channels=3, base_filters=16, deep_supervision=True).to(device)
+    student = LATUPStudent(in_channels=in_channels, out_channels=3, base_filters=16, deep_supervision=True).to(device)
     optimizer = torch.optim.AdamW(student.parameters(), lr=args.student_lr, weight_decay=1e-5)
     task_loss = WeightedDiceBCELoss(weights=[1.0, 1.0, 3.0])
     kd_loss = DWKDLoss(
@@ -353,17 +378,20 @@ def train_student(args, teacher, train_loader, val_loader, device, amp=False):
     return best_path
 
 
-def load_student(path, device):
+def load_student(path, device, in_channels=4):
     if not path.exists():
         raise FileNotFoundError(f"Student checkpoint not found: {path}")
-    model = LATUPStudent(in_channels=4, out_channels=3, base_filters=16, deep_supervision=True).to(device)
+    model = LATUPStudent(in_channels=in_channels, out_channels=3, base_filters=16, deep_supervision=True).to(device)
     state = torch.load(path, map_location=device, weights_only=False)
     model.load_state_dict(state["model_state_dict"])
     return model
 
 
 def main():
+    global ROI_SIZE
     args = parse_args()
+    ROI_SIZE = (args.roi_size,) * 3
+    in_ch = 1 if args.dataset == "kits23" else 4
     args.save_dir.mkdir(parents=True, exist_ok=True)
     set_seed()
     if not torch.cuda.is_available():
@@ -373,25 +401,27 @@ def main():
     print(f"Device: {torch.cuda.get_device_name(0)} | AMP={amp}")
 
     split_path = args.split_file or (args.save_dir / "split_70_10_20.json")
-    split = load_or_create_split(args.data_dir, split_path)
+    split = load_or_create_split(args.data_dir, split_path, args.dataset, args.max_cases)
     sdf_dir = args.save_dir / "sdfs" if args.stage in ("all", "student") else None
     teacher_train, student_train, val_loader, test_loader = make_loaders(
-        args.data_dir, split, args.teacher_batch_size, args.student_batch_size, args.workers, sdf_dir=sdf_dir
+        args.data_dir, split, args.teacher_batch_size, args.student_batch_size, args.workers, sdf_dir=sdf_dir,
+        dataset=args.dataset, cache_dir=args.save_dir / "kits23_cache", kits_spacing=args.kits_spacing,
+        prep_workers=args.prep_workers,
     )
     teacher_path = args.teacher_checkpoint or (args.save_dir / "best_saxnet_teacher.pth")
     student_path = args.save_dir / "best_distilled_student.pth"
 
     if args.stage in ("all", "teacher"):
-        teacher_path = train_teacher(args, teacher_train, val_loader, device, amp)
+        teacher_path = train_teacher(args, teacher_train, val_loader, device, amp, in_channels=in_ch)
     if args.stage in ("all", "student"):
-        teacher = load_frozen_teacher(teacher_path, device)
+        teacher = load_frozen_teacher(teacher_path, device, in_channels=in_ch)
         print("Student method: train.py-compatible FP32 + SDF Boundary Loss + fixed LR")
-        student_path = train_student(args, teacher, student_train, val_loader, device, amp=False)
+        student_path = train_student(args, teacher, student_train, val_loader, device, amp=False, in_channels=in_ch)
         del teacher
         torch.cuda.empty_cache()
     if args.stage in ("all", "test"):
-        teacher = load_frozen_teacher(teacher_path, device)
-        student = load_student(student_path, device)
+        teacher = load_frozen_teacher(teacher_path, device, in_channels=in_ch)
+        student = load_student(student_path, device, in_channels=in_ch)
         teacher_scores = evaluate(teacher, test_loader, device, amp, "Teacher test")
         student_scores = evaluate(student, test_loader, device, False, "Student test")
         print_scores("FINAL SAXNet teacher test", teacher_scores)
