@@ -1,67 +1,83 @@
-"""Train a SAXNet teacher, then distill it into LATUPStudent.
-
-This is an independent training version. It does not modify or reuse the split
-logic of train.py/train_teacher.py. A deterministic 70/10/20 split is persisted
-to the result directory and reused on every resume.
-"""
-
-import argparse
-import json
 import os
-import random
-from pathlib import Path
-
-import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+import numpy as np
 from tqdm import tqdm
+import random
+import time
+from models.teacher import get_teacher_model, load_teacher_weights
 
-from data.dataset import BraTS2023Dataset, find_nii_adaptive, precompute_sdfs_unified
-from models.saxnet import SAXNetV1
 from models.student import LATUPStudent
+from data.dataset import get_datasets
 from utils.loss_metrics import (
-    BoundaryLoss,
-    DWKDLoss,
-    WeightedDiceBCELoss,
-    calculate_dice,
-    calculate_hd95_per_channel,
+    WeightedDiceBCELoss, DWKDLoss, BoundaryLoss,
+    calculate_dice, calculate_hd95_per_channel
 )
 
+# ============================================================
+# 1. Core Configuration
+# ============================================================
+DATASET_TYPE = "msd"  # Choose "brats2023" or "msd"
+CURRENT_FOLD = 4  # from [0,4]
+NUM_FOLDS = 5
+SEED = 42
 
-ROOT = Path(__file__).resolve().parent
-DEFAULT_DATA_DIR = ROOT / "data" / "brats2023" / "Training"
-DEFAULT_SAVE_DIR = ROOT / "saxnet_distill_results_70_10_20_v1"
-SPLIT_SEED = 42
-ROI_SIZE = (128, 128, 128)
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
-    parser.add_argument("--save-dir", type=Path, default=DEFAULT_SAVE_DIR)
-    parser.add_argument("--split-file", type=Path, default=None)
-    parser.add_argument("--teacher-checkpoint", type=Path, default=None)
-    parser.add_argument("--stage", choices=("all", "teacher", "student", "test"), default="all")
-    parser.add_argument("--teacher-epochs", type=int, default=100)
-    parser.add_argument("--student-epochs", type=int, default=100)
-    parser.add_argument("--teacher-batch-size", type=int, default=1)
-    parser.add_argument("--student-batch-size", type=int, default=2)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--val-interval", type=int, default=5)
-    parser.add_argument("--teacher-lr", type=float, default=5e-5)
-    parser.add_argument("--student-lr", type=float, default=1e-4)
-    parser.add_argument("--no-amp", action="store_true")
-    parser.add_argument(
-        "--rce-weight",
-        type=float,
-        default=0.1,
-        help="Weight of RCE loss. Set to 0.0 to disable RCE.",
+# Path Configurations
+if DATASET_TYPE == "brats2023":
+    DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "brats2023", "Training")
+    TEACHER_WEIGHTS = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "checkpoints",
+        "BraTS2023",
+        "best_teacher_2023.pth"
     )
-    return parser.parse_args()
+    RESUME_LAST_PATH = None
+    RESUME_BEST_PATH = None
+else:
+    DATA_DIR = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "data",
+        "msd",
+        "Task01_BrainTumour"
+    )
+    TEACHER_WEIGHTS = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "checkpoints",
+        "MSD-BTS",
+        "best_teacher_msd.pth"
+    )
+    RESUME_LAST_PATH = None
+    RESUME_BEST_PATH = None
+
+SAVE_DIR = f"./kd_results_{DATASET_TYPE}_fold_{CURRENT_FOLD}"
+SDF_DIR = os.path.join(SAVE_DIR, "sdfs")
+os.makedirs(SDF_DIR, exist_ok=True)
+
+BEST_PATH = os.path.join(SAVE_DIR, "best_student.pt")
+LAST_PATH = os.path.join(SAVE_DIR, "last_student.pth")
+
+TOTAL_EPOCHS = 1
+BATCH_SIZE = 2
+LR = 1e-4
+ROI_SIZE = (128, 128, 128)
+VAL_INTERVAL = 5
+TEMPERATURE = 3.0
+
+# Loss Weights
+ALPHA_TASK = 0.6
+BETA_DWKD = 0.2
+USE_RCE = True
+GAMMA_RCE = 0.1
+RCE_T = 0.9
+USE_BOUNDARY = True
+BOUNDARY_WEIGHT = 0.1
 
 
-def set_seed(seed=SPLIT_SEED):
+# ============================================================
+# 2. Randomness and Environment Initialization
+# ============================================================
+def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -70,334 +86,349 @@ def set_seed(seed=SPLIT_SEED):
     torch.backends.cudnn.benchmark = False
 
 
-def discover_valid_cases(data_dir):
-    cases = sorted(p for p in Path(data_dir).iterdir() if p.is_dir() and not p.name.startswith("."))
-    required = ("flair", "t1", "t1ce", "t2", "seg")
-    valid = [p for p in cases if all(find_nii_adaptive(str(p), modality) for modality in required)]
-    if not valid:
-        raise FileNotFoundError(f"No complete BraTS training cases found under {data_dir}")
-    return valid
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+set_seed(SEED)
 
 
-def load_or_create_split(data_dir, split_path):
-    valid_cases = discover_valid_cases(data_dir)
-    names = [case.name for case in valid_cases]
-    if split_path.exists():
-        split = json.loads(split_path.read_text())
-        saved = split["train"] + split["val"] + split["test"]
-        if sorted(saved) != sorted(names):
-            raise RuntimeError("Existing split does not match the current dataset; use a new save directory.")
-    else:
-        indices = np.random.default_rng(SPLIT_SEED).permutation(len(names))
-        n_train = round(0.70 * len(names))
-        n_val = round(0.10 * len(names))
-        train_end = n_train
-        val_end = n_train + n_val
-        split = {
-            "seed": SPLIT_SEED,
-            "ratios": {"train": 0.70, "val": 0.10, "test": 0.20},
-            "train": [names[i] for i in indices[:train_end]],
-            "val": [names[i] for i in indices[train_end:val_end]],
-            "test": [names[i] for i in indices[val_end:]],
-        }
-        split_path.write_text(json.dumps(split, indent=2) + "\n")
-    print(
-        f"Fixed split (seed={split['seed']}): train={len(split['train'])}, "
-        f"val={len(split['val'])}, test={len(split['test'])}"
-    )
-    return split
+# ============================================================
+# 3. Efficiency Benchmarking Functions
+# ============================================================
+def benchmark_model(model, model_name, input_size=(1, 4, 128, 128, 128), device='cuda'):
+    try:
+        from thop import profile
+    except ImportError:
+        profile = None
 
-
-def make_loaders(data_dir, split, teacher_batch_size, student_batch_size, workers, sdf_dir=None):
-    def paths(part):
-        return [str(Path(data_dir) / name) for name in split[part]]
-
-    if sdf_dir is not None:
-        sdf_dir = Path(sdf_dir)
-        sdf_dir.mkdir(parents=True, exist_ok=True)
-        # Match train.py: precompute SDFs for the training and validation cases.
-        precompute_sdfs_unified(
-            str(data_dir),
-            paths("train") + paths("val"),
-            str(sdf_dir),
-            "BraTS",
-            ROI_SIZE,
-        )
-
-    datasets = {
-        "train": BraTS2023Dataset(
-            paths("train"), sdf_dir=str(sdf_dir) if sdf_dir else None,
-            roi_size=ROI_SIZE, augment=True, return_case_name=True
-        ),
-        "val": BraTS2023Dataset(
-            paths("val"), sdf_dir=str(sdf_dir) if sdf_dir else None,
-            roi_size=ROI_SIZE, augment=False, return_case_name=True
-        ),
-        "test": BraTS2023Dataset(paths("test"), roi_size=ROI_SIZE, augment=False, return_case_name=True),
-    }
-    common = {"num_workers": workers, "pin_memory": True, "persistent_workers": workers > 0}
-    teacher_train = DataLoader(datasets["train"], batch_size=teacher_batch_size, shuffle=True, **common)
-    student_train = DataLoader(datasets["train"], batch_size=student_batch_size, shuffle=True, **common)
-    val = DataLoader(datasets["val"], batch_size=1, shuffle=False, **common)
-    test = DataLoader(datasets["test"], batch_size=1, shuffle=False, **common)
-    return teacher_train, student_train, val, test
-
-
-def autocast_context(device, amp):
-    return torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp)
-
-
-def checkpoint_state(epoch, model, optimizer, scheduler, best_dice):
-    return {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "best_dice": best_dice,
-        "split_seed": SPLIT_SEED,
-        "split_ratios": (0.70, 0.10, 0.20),
-    }
-
-
-@torch.no_grad()
-def evaluate(model, loader, device, amp, description):
+    device = torch.device(device)
+    model.to(device)
     model.eval()
-    all_dice = []
-    for images, labels, _, _ in tqdm(loader, desc=description, leave=False):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        with autocast_context(device, amp):
-            logits = model(images)
-        all_dice.append(calculate_dice((torch.sigmoid(logits) > 0.5).float(), labels))
-    scores = np.asarray(all_dice, dtype=np.float64)
-    means = scores.mean(axis=0)
-    return {"mean": float(means.mean()), "wt": float(means[0]), "tc": float(means[1]), "et": float(means[2])}
 
+    # Create dummy input
+    dummy_input = torch.randn(input_size).to(device)
 
-def print_scores(prefix, scores):
-    print(
-        f"{prefix}: Dice={scores['mean']:.4f} "
-        f"(WT={scores['wt']:.4f}, TC={scores['tc']:.4f}, ET={scores['et']:.4f})"
-    )
+    # --- 1. Params & MACs ---
+    params_m, macs_g, tflops = 0, 0, 0
+    if profile is not None:
+        try:
+            # Wrapper to handle models that return tuples
+            class Wrapper(nn.Module):
+                def __init__(self, m): super().__init__(); self.m = m
 
+                def forward(self, x):
+                    out = self.m(x)
+                    return out[0] if isinstance(out, (list, tuple)) else out
 
-@torch.no_grad()
-def evaluate_student_trainpy(model, loader, device, description):
-    """Match train.py validation: FP32 Dice plus HD95."""
-    model.eval()
-    all_dice, all_hd95 = [], []
-    for images, labels, _, _ in tqdm(loader, desc=description, leave=False):
-        images = images.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
-        logits = model(images)
-        preds = (torch.sigmoid(logits) > 0.5).float()
-        all_dice.append(calculate_dice(preds, labels))
-        all_hd95.append(calculate_hd95_per_channel(preds, labels, roi_size=ROI_SIZE))
-    dice = np.asarray(all_dice, dtype=np.float64)
-    hd95 = np.asarray(all_hd95, dtype=np.float64)
-    means = dice.mean(axis=0)
-    return {
-        "mean": float(means.mean()),
-        "wt": float(means[0]),
-        "tc": float(means[1]),
-        "et": float(means[2]),
-        "hd95": float(np.nanmean(hd95)),
-    }
+            macs, params = profile(Wrapper(model), inputs=(dummy_input,), verbose=False)
+            params_m = params / 1e6
+            macs_g = macs / 1e9
+            # TFLOPS = 2 * MACs / 10^12 (Assuming multiply-accumulate is 2 operations)
+            tflops = (2 * macs) / 1e12
+        except Exception as e:
+            print(f"thop calculation failed: {e}")
 
+    # --- 2. Latency ---
+    # Warm-up
+    for _ in range(10):
+        with torch.no_grad(): _ = model(dummy_input)
 
-def train_teacher(args, train_loader, val_loader, device, amp):
-    best_path = args.save_dir / "best_saxnet_teacher.pth"
-    last_path = args.save_dir / "last_saxnet_teacher.pth"
-    model = SAXNetV1().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.teacher_lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.teacher_epochs, eta_min=1e-6)
-    scaler = torch.amp.GradScaler(device.type, enabled=amp)
-    loss_fn = WeightedDiceBCELoss(weights=[1.0, 1.0, 3.0])
-    start_epoch, best_dice = 1, 0.0
+    if device.type == 'cuda':
+        torch.cuda.synchronize()
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
 
-    if last_path.exists():
-        state = torch.load(last_path, map_location=device, weights_only=False)
-        model.load_state_dict(state["model_state_dict"])
-        optimizer.load_state_dict(state["optimizer_state_dict"])
-        scheduler.load_state_dict(state["scheduler_state_dict"])
-        start_epoch = state["epoch"] + 1
-        best_dice = state.get("best_dice", 0.0)
-        print(f"Resuming SAXNet teacher at epoch {start_epoch}; best Dice={best_dice:.4f}")
-
-    print(f"SAXNet teacher parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")
-    for epoch in range(start_epoch, args.teacher_epochs + 1):
-        model.train()
-        losses, dices = [], []
-        progress = tqdm(train_loader, desc=f"Teacher {epoch}/{args.teacher_epochs}")
-        for images, labels, _, _ in progress:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
-            with autocast_context(device, amp):
-                logits = model(images)
-                loss = loss_fn(logits, labels)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            dice = calculate_dice((torch.sigmoid(logits.detach()) > 0.5).float(), labels)
-            losses.append(loss.item())
-            dices.append(np.mean(dice))
-            progress.set_postfix(loss=f"{loss.item():.4f}", dice=f"{np.mean(dice):.3f}")
-        scheduler.step()
-
-        validate = epoch == 1 or epoch % args.val_interval == 0 or epoch == args.teacher_epochs
-        if validate:
-            scores = evaluate(model, val_loader, device, amp, f"Teacher val {epoch}")
-            print_scores(f"Teacher epoch {epoch} | loss={np.mean(losses):.4f}", scores)
-            if scores["mean"] > best_dice:
-                best_dice = scores["mean"]
-                torch.save(checkpoint_state(epoch, model, optimizer, scheduler, best_dice), best_path)
-                print(f"Saved best SAXNet teacher: {best_path}")
-        else:
-            print(f"Teacher epoch {epoch}: loss={np.mean(losses):.4f}, train Dice={np.mean(dices):.4f}")
-        torch.save(checkpoint_state(epoch, model, optimizer, scheduler, best_dice), last_path)
-    return best_path
-
-
-def load_frozen_teacher(path, device):
-    if not path.exists():
-        raise FileNotFoundError(f"SAXNet teacher checkpoint not found: {path}")
-    model = SAXNetV1().to(device)
-    state = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(state["model_state_dict"])
-    model.eval()
-    model.requires_grad_(False)
-    print(f"Loaded frozen SAXNet teacher from epoch {state['epoch']} (Dice={state['best_dice']:.4f})")
-    return model
-
-
-def train_student(args, teacher, train_loader, val_loader, device, amp=False):
-    best_path = args.save_dir / "best_distilled_student.pth"
-    last_path = args.save_dir / "last_distilled_student.pth"
-    student = LATUPStudent(in_channels=4, out_channels=3, base_filters=16, deep_supervision=True).to(device)
-    optimizer = torch.optim.AdamW(student.parameters(), lr=args.student_lr, weight_decay=1e-5)
-    task_loss = WeightedDiceBCELoss(weights=[1.0, 1.0, 3.0])
-    kd_loss = DWKDLoss(
-        temperature=3.0,
-        use_rce=args.rce_weight > 0.0,
-        rce_t=0.9,
-    )
-    boundary_loss = BoundaryLoss()
-    start_epoch, best_dice = 1, 0.0
-
-    if last_path.exists():
-        state = torch.load(last_path, map_location=device, weights_only=False)
-        student.load_state_dict(state["model_state_dict"])
-        optimizer.load_state_dict(state["optimizer_state_dict"])
-        start_epoch = state["epoch"] + 1
-        best_dice = state.get("best_dice", 0.0)
-        print(f"Resuming distilled student at epoch {start_epoch}; best Dice={best_dice:.4f}")
-
-    print(f"Student parameters: {sum(p.numel() for p in student.parameters()) / 1e6:.2f} M")
-    print(f"RCE weight: {args.rce_weight:.4f} | enabled={args.rce_weight > 0.0}")
-    for epoch in range(start_epoch, args.student_epochs + 1):
-        student.train()
-        losses, dices = [], []
-        progress = tqdm(train_loader, desc=f"Student {epoch}/{args.student_epochs}")
-        for images, labels, sdfs, _ in progress:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-            sdfs = sdfs.to(device, non_blocking=True)
-            optimizer.zero_grad(set_to_none=True)
+        start_event.record()
+        for _ in range(100):  # Average over 100 runs
             with torch.no_grad():
-                teacher_logits = teacher(images)
-            outputs = student(images)
-            main, half, quarter = outputs
-            supervised = task_loss(main, labels)
-            dwkd, rce = kd_loss(main, teacher_logits)
-            boundary = boundary_loss(main, labels, precomputed_sdfs=sdfs)
-            aux_half = task_loss(half, F.interpolate(labels, scale_factor=0.5, mode="nearest"))
-            aux_quarter = task_loss(quarter, F.interpolate(labels, scale_factor=0.25, mode="nearest"))
-            # Exactly match train.py's effective weights, including Boundary Loss.
-            loss = (
-                0.6 * supervised + 0.2 * dwkd + args.rce_weight * rce + 0.1 * boundary
-                + 0.3 * aux_half + 0.15 * aux_quarter
-            )
+                _ = model(dummy_input)
+        end_event.record()
+        torch.cuda.synchronize()
+        latency_ms = start_event.elapsed_time(end_event) / 100
+    else:
+        # CPU Fallback timing
+        t0 = time.time()
+        for _ in range(50):
+            with torch.no_grad(): _ = model(dummy_input)
+        latency_ms = (time.time() - t0) * 1000 / 50
+
+    # --- 3. Inference Memory ---
+    im_mb = 0
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        with torch.no_grad():
+            _ = model(dummy_input)
+        im_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+
+    # --- 4. Training Memory (Simulating backward pass) ---
+    tm_mb = 0
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        model.train()  # Switch back to training mode
+
+        # Check if the model has trainable parameters
+        if any(p.requires_grad for p in model.parameters()):
+            opt = torch.optim.Adam(model.parameters())
+            opt.zero_grad()
+            out = model(dummy_input)
+            loss = (out[0].mean() if isinstance(out, (list, tuple)) else out.mean())
+            loss.backward()
+            tm_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+        else:
+            tm_mb = 0  # Frozen models have no training overhead
+
+    model.eval()
+
+    return {
+        "Model": model_name,
+        "Params (M)": f"{params_m:.2f}",
+        "MACs (G)": f"{macs_g:.2f}",
+        "TFLOPS": f"{tflops:.4f}",
+        "Latency (ms)": f"{latency_ms:.2f}",
+        "Inference Mem (MB)": f"{im_mb:.0f}",
+        "Training Mem (MB)": f"{tm_mb:.0f}"
+    }
+
+
+def print_table(results):
+    """Prints a clean ASCII table for benchmark comparison"""
+    if not results: return
+    headers = list(results[0].keys())
+    # Calculate column widths
+    widths = [max(len(h), max(len(str(r[h])) for r in results)) + 2 for h in headers]
+
+    border = "+" + "+".join(["-" * w for w in widths]) + "+"
+
+    print("\n" + border)
+    header_row = "|" + "|".join([f" {h:<{w - 2}} " for h, w in zip(headers, widths)]) + "|"
+    print(header_row)
+    print(border)
+
+    for res in results:
+        row = "|" + "|".join([f" {str(res[h]):<{w - 2}} " for h, w in zip(headers, widths)]) + "|"
+        print(row)
+    print(border + "\n")
+
+
+# ============================================================
+# 4. Main Training Pipeline
+# ============================================================
+def main():
+    train_ds, val_ds = get_datasets(
+        data_dir=DATA_DIR,
+        fold=CURRENT_FOLD,
+        num_folds=NUM_FOLDS,
+        seed=SEED,
+        sdf_dir=SDF_DIR,
+        roi_size=ROI_SIZE
+    )
+
+    train_loader = torch.utils.data.DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2,
+                                               pin_memory=True)
+    val_loader = torch.utils.data.DataLoader(val_ds, batch_size=1, shuffle=False, num_workers=2, pin_memory=True)
+
+    # --- Model Initialization ---
+    """teacher_model = UNet(
+        spatial_dims=3, in_channels=4, out_channels=3,
+        channels=(32, 64, 128, 256, 512), strides=(2, 2, 2, 2), num_res_units=2
+    ).to(device)
+
+    try:
+        teacher_ckpt = torch.load(TEACHER_WEIGHTS, map_location='cpu')
+        sd = teacher_ckpt['model_state_dict'] if 'model_state_dict' in teacher_ckpt else teacher_ckpt
+        teacher_model.load_state_dict(sd, strict=False)
+        print("Teacher model loaded successfully")
+    except Exception as e:
+        print(f"Teacher model failed to load: {e}")
+
+    teacher_model.eval()"""
+    teacher_model = get_teacher_model(device)
+    teacher_model = load_teacher_weights(teacher_model, TEACHER_WEIGHTS, device)
+
+    student_model = LATUPStudent(in_channels=4, out_channels=3, base_filters=16, deep_supervision=True).to(device)
+    optimizer = torch.optim.AdamW(student_model.parameters(), lr=LR, weight_decay=1e-5)
+
+    # --- Loss Functions ---
+    task_loss_fn = WeightedDiceBCELoss(weights=[1.0, 1.0, 3.0])
+    dwkd_loss_fn = DWKDLoss(temperature=TEMPERATURE, use_rce=USE_RCE, rce_t=RCE_T)
+    boundary_loss_fn = BoundaryLoss()
+
+    # --- Resume Training Logic ---
+    start_epoch = 1
+    best_dice = 0.0
+
+    # 1. Resume from Last Checkpoint
+    if RESUME_LAST_PATH and os.path.exists(RESUME_LAST_PATH):
+        ckpt = torch.load(RESUME_LAST_PATH, map_location=device)
+        student_model.load_state_dict(ckpt['model_state_dict'])
+        optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        start_epoch = ckpt['epoch'] + 1
+        best_dice = ckpt.get('best_dice', 0.0)
+
+    # 2. Check Best Checkpoint
+    if RESUME_BEST_PATH and os.path.exists(RESUME_BEST_PATH):
+        ckpt_best = torch.load(RESUME_BEST_PATH, map_location='cpu')
+        actual_best = ckpt_best.get('best_dice', 0.0)
+        if actual_best > best_dice:
+            best_dice = actual_best
+            print(f"Calibrated Best Dice to: {best_dice:.4f}")
+
+            # If Last was not loaded, start fine-tuning from Best
+            if not (RESUME_LAST_PATH and os.path.exists(RESUME_LAST_PATH)):
+                print("No Last weight found, starting from Best weight...")
+                student_model.load_state_dict(ckpt_best['model_state_dict'])
+
+    print(f"Starting training: Epoch {start_epoch} - {TOTAL_EPOCHS}, Best Dice: {best_dice:.4f}")
+
+    # --- Training Loop ---
+    for epoch in range(start_epoch, TOTAL_EPOCHS + 1):
+        student_model.train()
+        epoch_loss = 0.0
+        train_dices = []
+        pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{TOTAL_EPOCHS}')
+
+        for batch in pbar:
+            images, labels, sdfs, _ = batch
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+            sdfs = sdfs.to(device, non_blocking=True)
+
+            optimizer.zero_grad()
+
+            with torch.no_grad():
+                teacher_outputs = teacher_model(images)
+
+            student_outputs = student_model(images)
+
+            # Deep Supervision
+            if isinstance(student_outputs, (list, tuple)):
+                logits_main = student_outputs[0]
+                logits_d2 = student_outputs[1]
+                logits_d3 = student_outputs[2]
+
+                # Main Task Loss
+                L_task = task_loss_fn(logits_main, labels)
+                L_dwkdl, L_rce = dwkd_loss_fn(logits_main, teacher_outputs)
+
+                L_boundary = torch.tensor(0.0, device=device)
+                if USE_BOUNDARY:
+                    L_boundary = boundary_loss_fn(logits_main, labels, precomputed_sdfs=sdfs)
+
+                loss_main = ALPHA_TASK * L_task + \
+                            BETA_DWKD * L_dwkdl + \
+                            (GAMMA_RCE * L_rce if USE_RCE else 0.0) + \
+                            (BOUNDARY_WEIGHT * L_boundary if USE_BOUNDARY else 0.0)
+
+                # Auxiliary Losses for DS
+                labels_d2 = F.interpolate(labels, scale_factor=0.5, mode='nearest')
+                loss_d2 = ALPHA_TASK * task_loss_fn(logits_d2, labels_d2)
+
+                labels_d3 = F.interpolate(labels, scale_factor=0.25, mode='nearest')
+                loss_d3 = ALPHA_TASK * task_loss_fn(logits_d3, labels_d3)
+
+                loss = loss_main + 0.5 * loss_d2 + 0.25 * loss_d3
+
+                probs = torch.sigmoid(logits_main)
+
+            else:
+                # No Deep Supervision
+                L_task = task_loss_fn(student_outputs, labels)
+                L_dwkdl, L_rce = dwkd_loss_fn(student_outputs, teacher_outputs)
+
+                L_boundary = torch.tensor(0.0, device=device)
+                if USE_BOUNDARY:
+                    L_boundary = boundary_loss_fn(student_outputs, labels, precomputed_sdfs=sdfs)
+
+                loss = ALPHA_TASK * L_task + \
+                       BETA_DWKD * L_dwkdl + \
+                       (GAMMA_RCE * L_rce if USE_RCE else 0.0) + \
+                       (BOUNDARY_WEIGHT * L_boundary if USE_BOUNDARY else 0.0)
+
+                probs = torch.sigmoid(student_outputs)
+
             loss.backward()
             optimizer.step()
-            dice = calculate_dice((torch.sigmoid(main.detach()) > 0.5).float(), labels)
-            losses.append(loss.item())
-            dices.append(np.mean(dice))
-            progress.set_postfix(loss=f"{loss.item():.4f}", dice=f"{np.mean(dice):.3f}")
-        validate = epoch == 1 or epoch % args.val_interval == 0 or epoch == args.student_epochs
-        if validate:
-            scores = evaluate_student_trainpy(student, val_loader, device, f"Student val {epoch}")
-            print_scores(f"Student epoch {epoch} | loss={np.mean(losses):.4f}", scores)
-            print(f"Student epoch {epoch} | HD95={scores['hd95']:.2f}")
-            if scores["mean"] > best_dice:
-                best_dice = scores["mean"]
+
+            with torch.no_grad():
+                preds = (probs > 0.5).float()
+                train_dices.append(calculate_dice(preds, labels))
+
+            epoch_loss += loss.item()
+            pbar.set_postfix({'Loss': f'{loss.item():.4f}', 'Dice': f'{np.mean(train_dices[-1]):.3f}'})
+
+        epoch_loss /= max(len(train_loader), 1)
+        mean_train_dice = float(np.mean([np.mean(d) for d in train_dices])) if train_dices else 0.0
+
+        # --- Validation ---
+        if epoch % VAL_INTERVAL == 0 or epoch == 1:
+            student_model.eval()
+            val_dices, val_hd95s = [], []
+            with torch.no_grad():
+                for batch in val_loader:
+                    images, labels, _, _ = batch
+                    images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+
+                    outputs = student_model(images)
+
+                    # Extract main branch for validation if using Deep Supervision
+                    if isinstance(outputs, (list, tuple)):
+                        outputs = outputs[0]
+
+                    probs = torch.sigmoid(outputs)
+                    preds = (probs > 0.5).float()
+
+                    val_dices.append(calculate_dice(preds, labels))
+                    val_hd95s.append(calculate_hd95_per_channel(preds, labels))
+
+            # Metric Calculations
+            val_dices_array = np.array(val_dices) if len(val_dices) > 0 else np.zeros((1, 3))
+            mean_val_dice = float(np.mean(val_dices_array))
+
+            val_hd95_array = np.array(val_hd95s) if len(val_hd95s) > 0 else np.full((1, 3), np.inf)
+            mean_val_hd95 = float(np.nanmean(val_hd95_array))
+
+            print(f'Epoch {epoch}:')
+            print(f'  Train Loss={epoch_loss:.4f}, Dice={mean_train_dice:.4f}')
+            print(
+                f'  Val Dice={mean_val_dice:.4f} (WT={val_dices_array[:, 0].mean():.4f}, TC={val_dices_array[:, 1].mean():.4f}, ET={val_dices_array[:, 2].mean():.4f})')
+            print(f'  Val HD95={mean_val_hd95:.2f}')
+
+            # Save Best Model
+            if mean_val_dice > best_dice:
+                best_dice = mean_val_dice
                 torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": student.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "best_dice": best_dice,
-                    "rce_weight": args.rce_weight,
-                }, best_path)
-                print(f"Saved best distilled student: {best_path}")
-        else:
-            print(f"Student epoch {epoch}: loss={np.mean(losses):.4f}, train Dice={np.mean(dices):.4f}")
+                    'epoch': epoch,
+                    'model_state_dict': student_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'best_dice': best_dice,
+                }, BEST_PATH)
+                print(f'Saving Best Model: {best_dice:.4f}')
+            else:
+                print(f'(Best was {best_dice:.4f})')
+
+        # Save Last Checkpoint
         torch.save({
-            "epoch": epoch,
-            "model_state_dict": student.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "best_dice": best_dice,
-            "rce_weight": args.rce_weight,
-        }, last_path)
-    return best_path
+            'epoch': epoch,
+            'model_state_dict': student_model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_dice': best_dice,
+        }, LAST_PATH)
 
+    print(f"\nTraining Complete! Best Dice: {best_dice:.4f}")
 
-def load_student(path, device):
-    if not path.exists():
-        raise FileNotFoundError(f"Student checkpoint not found: {path}")
-    model = LATUPStudent(in_channels=4, out_channels=3, base_filters=16, deep_supervision=True).to(device)
-    state = torch.load(path, map_location=device, weights_only=False)
-    model.load_state_dict(state["model_state_dict"])
-    return model
+    dummy_shape = (1, 4, *ROI_SIZE)
+    print("\n===== Comprehensive Efficiency Benchmark =====")
 
+    # Benchmark Teacher
+    res_t = benchmark_model(teacher_model, "Teacher (UNet)", dummy_shape, device)
 
-def main():
-    args = parse_args()
-    args.save_dir.mkdir(parents=True, exist_ok=True)
-    set_seed()
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required for this 3D training pipeline.")
-    device = torch.device("cuda")
-    amp = not args.no_amp
-    print(f"Device: {torch.cuda.get_device_name(0)} | AMP={amp}")
+    # Benchmark Student
+    # Note: DS is disabled here to measure actual inference latency in production
+    student_model_eval = LATUPStudent(in_channels=4, out_channels=3, base_filters=16, deep_supervision=False).to(device)
+    student_model_eval.load_state_dict(student_model.state_dict(), strict=False)
+    res_s = benchmark_model(student_model_eval, "Student (LATUP)", dummy_shape, device)
 
-    split_path = args.split_file or (args.save_dir / "split_70_10_20.json")
-    split = load_or_create_split(args.data_dir, split_path)
-    sdf_dir = args.save_dir / "sdfs" if args.stage in ("all", "student") else None
-    teacher_train, student_train, val_loader, test_loader = make_loaders(
-        args.data_dir, split, args.teacher_batch_size, args.student_batch_size, args.workers, sdf_dir=sdf_dir
-    )
-    teacher_path = args.teacher_checkpoint or (args.save_dir / "best_saxnet_teacher.pth")
-    student_path = args.save_dir / "best_distilled_student.pth"
-
-    if args.stage in ("all", "teacher"):
-        teacher_path = train_teacher(args, teacher_train, val_loader, device, amp)
-    if args.stage in ("all", "student"):
-        teacher = load_frozen_teacher(teacher_path, device)
-        print("Student method: train.py-compatible FP32 + SDF Boundary Loss + fixed LR")
-        student_path = train_student(args, teacher, student_train, val_loader, device, amp=False)
-        del teacher
-        torch.cuda.empty_cache()
-    if args.stage in ("all", "test"):
-        teacher = load_frozen_teacher(teacher_path, device)
-        student = load_student(student_path, device)
-        teacher_scores = evaluate(teacher, test_loader, device, amp, "Teacher test")
-        student_scores = evaluate(student, test_loader, device, False, "Student test")
-        print_scores("FINAL SAXNet teacher test", teacher_scores)
-        print_scores("FINAL distilled student test", student_scores)
-        report = {"teacher": teacher_scores, "student": student_scores}
-        (args.save_dir / "test_metrics.json").write_text(json.dumps(report, indent=2) + "\n")
+    # Print final comparison table
+    print_table([res_t, res_s])
 
 
 if __name__ == "__main__":
