@@ -195,7 +195,3 @@ If you use this code or the pretrained weights, please cite our earlier Uni-Ligh
 }
 ```
 work this project builds on.
-
-## License
-
-TODO: add a license for this repository (e.g. MIT or a research-only license). Please check the BraTS and MSD dataset terms of use before redistributing any data.
