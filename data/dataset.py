@@ -3,6 +3,7 @@
 Split protocol (used for every reported result):
     KFold(n_splits=5, shuffle=True, random_state=42) over the *sorted* list of cases,
     fold index 4 is the held-out evaluation fold (250 BraTS cases / 96 MSD cases).
+    """
 
 import glob
 import os
