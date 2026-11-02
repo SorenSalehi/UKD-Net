@@ -194,10 +194,7 @@ If you use this code or the pretrained weights, please cite our earlier Uni-Ligh
   howpublished = {\url{https://github.com/SorenSalehi/UKD-Net}}
 }
 ```
-
-## Acknowledgements
-
-We thank the organisers and contributors of the BraTS 2023 challenge and the Medical Segmentation Decathlon for the datasets, and the authors of LATUP-Net, nnU-Net, MONAI and CBAM, whose work this project builds on.
+work this project builds on.
 
 ## License
 
